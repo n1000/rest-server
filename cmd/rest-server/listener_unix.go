@@ -14,7 +14,7 @@ import (
 
 // findListener tries to find a listener via systemd socket activation. If that
 // fails, it tries to create a listener on addr.
-func findListener(addr string) (listener net.Listener, err error) {
+func findListener(addr string, network string) (listener net.Listener, err error) {
 	// try systemd socket activation
 	listeners, err := activation.Listeners()
 	if err != nil {
@@ -34,7 +34,7 @@ func findListener(addr string) (listener net.Listener, err error) {
 				return nil, fmt.Errorf("listen on %v failed: %w", addr, err)
 			}
 		} else { // assume tcp
-			listener, err = net.Listen("tcp", addr)
+			listener, err = net.Listen(network, addr)
 			if err != nil {
 				return nil, fmt.Errorf("listen on %v failed: %w", addr, err)
 			}

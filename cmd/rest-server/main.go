@@ -103,6 +103,19 @@ func (app *restServerApp) ListenerAddress() net.Addr {
 	return app.listenerAddress
 }
 
+// See the "Notes" section of the Go net package documentation for more
+// details.
+func osRequiresSeparateTcp6Listener() bool {
+	switch runtime.GOOS {
+	case "openbsd":
+		return true
+	case "dragonfly":
+		return true
+	default:
+		return false
+	}
+}
+
 func (app *restServerApp) runRoot(cmd *cobra.Command, args []string) error {
 	log.SetFlags(0)
 
@@ -152,39 +165,80 @@ func (app *restServerApp) runRoot(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	listener, err := findListener(app.Server.Listen)
-	if err != nil {
-		return fmt.Errorf("unable to listen: %w", err)
+	listener_tcp, err_tcp := findListener(app.Server.Listen, "tcp")
+	if !osRequiresSeparateTcp6Listener() && err_tcp != nil {
+		return fmt.Errorf("unable to listen: %w", err_tcp)
 	}
 
-	// set listener address, this is useful for tests
-	app.listenerAddressMu.Lock()
-	app.listenerAddress = listener.Addr()
-	app.listenerAddressMu.Unlock()
+	var listener_tcp6 net.Listener = nil
+	var err_tcp6 error = nil
+	if osRequiresSeparateTcp6Listener() {
+		listener_tcp6, err_tcp6 = findListener(app.Server.Listen, "tcp6")
 
-	srv := &http.Server{
-		Handler: handler,
+		if err_tcp != nil && err_tcp6 != nil {
+			return fmt.Errorf("unable to listen: tcp error: %w, tcp6 error: %w", err_tcp, err_tcp6)
+		} else if err_tcp != nil {
+			log.Printf("warning: %s", err_tcp)
+		} else if err_tcp6 != nil {
+			log.Printf("warning: %s", err_tcp6)
+		}
+	} else {
+		// set listener address, this is useful for tests
+		app.listenerAddressMu.Lock()
+		app.listenerAddress = listener_tcp.Addr()
+		app.listenerAddressMu.Unlock()
 	}
 
-	// run server in background
-	go func() {
+	runServer := func(listener net.Listener, srv *http.Server, serverType string) {
+		var err error = nil
+
 		if !enabledTLS {
 			err = srv.Serve(listener)
 		} else {
-			log.Printf("TLS enabled, private key %s, pubkey %v", privateKey, publicKey)
+			log.Printf("%s: TLS enabled, private key %s, pubkey %v", serverType, privateKey, publicKey)
 			err = srv.ServeTLS(listener, publicKey, privateKey)
 		}
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("listen and serve returned err: %v", err)
+			log.Fatalf("%s: listen and serve returned err: %v", serverType, err)
 		}
-	}()
+	}
+
+	var srv_tcp *http.Server = nil
+	var srv_tcp6 *http.Server = nil
+
+	// run server(s) in background
+	if listener_tcp != nil {
+		srv_tcp = &http.Server{
+			Handler: handler,
+		}
+		go runServer(listener_tcp, srv_tcp, "tcp")
+	}
+	if listener_tcp6 != nil {
+		srv_tcp6 = &http.Server{
+			Handler: handler,
+		}
+		go runServer(listener_tcp6, srv_tcp6, "tcp6")
+	}
 
 	// wait until done
 	<-app.CmdRoot.Context().Done()
 
-	// gracefully shutdown server
-	if err := srv.Shutdown(context.Background()); err != nil {
-		return fmt.Errorf("server shutdown returned an err: %w", err)
+	// gracefully shutdown server(s)
+	err_tcp = nil
+	err_tcp6 = nil
+	if srv_tcp != nil {
+		err_tcp = srv_tcp.Shutdown(context.Background());
+	}
+	if srv_tcp6 != nil {
+		err_tcp6 = srv_tcp6.Shutdown(context.Background());
+	}
+
+	if err_tcp != nil && err_tcp6 != nil {
+		return fmt.Errorf("server shutdown returned an err: tcp: %w, tcp6: %w", err_tcp, err_tcp6)
+	} else if err_tcp != nil {
+		return fmt.Errorf("server shutdown returned an err: tcp: %w", err_tcp)
+	} else if err_tcp6 != nil {
+		return fmt.Errorf("server shutdown returned an err: tcp6: %w", err_tcp6)
 	}
 
 	log.Println("shutdown cleanly")
